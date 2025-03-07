@@ -59,7 +59,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     static constexpr uint32_t SMEM_SCALES_B_SIZE = ceil_div<uint32_t>(SHAPE_K_SCALES * (kMustUseUniformedScaleB ? 1 : 2) * sizeof(float), sizeof(Barrier)) * sizeof(Barrier);
 
     // Configs
-    constexpr uint32_t kFullKOfAllStages = kNumStages * BLOCK_K;
+    constexpr uint32_t kFullKOfAllStages = kNumStages * BLOCK_K; // 流水线里同时有kNumStages个Block_K
     constexpr uint32_t kNumThreads = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
     constexpr uint32_t kNumMathThreads = kNumThreads - kNumTMAThreads;
     constexpr uint32_t kNumIterations = ceil_div(SHAPE_K, kFullKOfAllStages);
@@ -76,7 +76,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     __syncwarp();
 
     // Align to 1024 bytes for swizzle-128B
-    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    extern __shared__ __align__(1024) uint8_t smem_buffer[]; // 中间矩阵 D | A_stage_0 | B_stage_0 | Scales A_stage_0 | A_stage_1 | B_stage_1 | Scales A_stage_1 | ... | Scales B
     DG_STATIC_ASSERT(SMEM_D_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
 
     // Data on shared memory
@@ -142,7 +142,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
     // Register reconfigurations
     constexpr int kNumTMARegisters = 40;
-    constexpr int kNumMathRegisters = 232;
+    constexpr int kNumMathRegisters = 232; 
+    // Hopper 64K 32-bit registers per SM, 每个Thread最多255个寄存器，每个SM最多32个Thread Block 64个warp (2048 threads), 每个thread block最多1024个Thread
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
@@ -166,11 +167,13 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     #pragma unroll
                     for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
                         // Wait consumer release
+                        // SM 0 load 的 A0, 发给 SM 1, 所以都在等SM 1 算完上一波
                         empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
 
                         // Issue TMA A with broadcasting
                         auto& full_barrier = *full_barriers[s];
                         int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
+                        // SM90_TMA_LOAD_MULTICAST_2D
                         tma_copy<kNumTMAMulticast>(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
                                                    smem_a[s], k_idx, scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
                         tma_copy<kNumTMAMulticast>(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
@@ -206,6 +209,9 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
         const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / kNumMathThreadsPerGroup, 0);
         const auto r_0 = warp_idx * 16 + lane_idx / 4, r_1 = r_0 + 8;
+        // 这里需要看这个图：https://docs.nvidia.com/cuda/parallel-thread-execution/#wgmma-64n16-d
+        // T0～T3处理第1行和第8行，T4～T7处理第2行和第9行 ......
+        // A是1x128的Scale，B是128*128的Scale
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -221,6 +227,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             // Load B scales with math warp-groups
             // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
             if (threadIdx.x >= 32) {
+                // 128x128的scale，所以用BLOCK_K=128来除，并不是K维，只是size正好一样
                 auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
                 auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
                 #pragma unroll
@@ -266,12 +273,15 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     #pragma unroll
                     for (int i = 0; i < WGMMA::kNumAccum; ++ i)
                         warpgroup_fence_operand(accum[i]);
+                    // Ensure the registers of the WGMMA instruction do not get touched by anything else in the middle of the WGMMA batch of instructions
                     warpgroup_arrive();
                     #pragma unroll
                     for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
                         auto desc_a = make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
                         auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
                         WGMMA::wgmma(desc_a, desc_b, accum, k);
+                        // k = 0 scale-d = False, wgmma.mma_async 算 D = A*B
+                        // k > 0 scale-d = True, wgmma.mma_async 算 D = A*B + D
                     }
                     warpgroup_commit_batch();
                     #pragma unroll
@@ -291,6 +301,10 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     #pragma unroll
                     for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
                         bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
+                        // 以T0为例，i * 4 + 0是d0、d1, i * 4 + 1是d4、d5 对应第0行，第0/1列和第8/9列
+                        // i * 4 + 2是d2、d3, i * 4 + 3是d6、d7 对应第8行，第0/1列和第8/9列
+                        // 所以i * 4 + 0和i * 4 + 2是同一行，用scale_0_0和scale_0_1
+                        // i * 4 + 1和i * 4 + 3是同一行，用scale_1_0和scale_1_1
                         final_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
                         final_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
                         final_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
